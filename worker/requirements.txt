@@ -1,0 +1,10 @@
+modal==0.73.0
+mediapipe==0.10.20
+opencv-python-headless==4.11.0.86
+boto3==1.35.97
+supabase==2.10.0
+numpy==2.2.1
+
+# Testing
+pytest==8.3.4
+pytest-mock==3.14.0
