@@ -1,4 +1,11 @@
-import type { JobStatusResponse, ProPlayer, ShotType, UploadResponse } from "@/types/analysis";
+import type {
+  JobHistoryResponse,
+  JobStatusResponse,
+  ProPlayer,
+  ReportResponse,
+  ShotType,
+  UploadResponse,
+} from "@/types/analysis";
 
 const BASE_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
@@ -63,4 +70,12 @@ export async function uploadVideo(
 
 export async function getJobStatus(token: string, jobId: string): Promise<JobStatusResponse> {
   return authFetch(`/api/v1/analysis/${jobId}/status`, token);
+}
+
+export async function fetchReport(token: string, reportId: string): Promise<ReportResponse> {
+  return authFetch(`/api/v1/reports/${reportId}`, token);
+}
+
+export async function fetchJobHistory(token: string): Promise<JobHistoryResponse> {
+  return authFetch("/api/v1/users/me/jobs", token);
 }

@@ -1,65 +1,144 @@
-import Image from "next/image";
+"use client";
 
-export default function Home() {
+import { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
+import { fetchJobHistory } from "@/lib/api";
+import type { JobHistoryItem } from "@/types/analysis";
+
+const TOKEN_PLACEHOLDER = process.env.NEXT_PUBLIC_DEV_TOKEN ?? "";
+
+const SHOT_LABELS: Record<string, string> = {
+  serve: "Serve",
+  forehand: "Forehand",
+  backhand: "Backhand",
+  volley: "Volley",
+};
+
+function RecentRow({ item, onClick }: { item: JobHistoryItem; onClick: () => void }) {
+  const date = new Date(item.created_at).toLocaleDateString("en-US", {
+    month: "short",
+    day: "numeric",
+  });
+  const score = item.similarity_score;
+  const scoreColor = score === null ? "" : score >= 70 ? "text-green-600" : score >= 45 ? "text-amber-600" : "text-red-500";
+
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
+    <button
+      onClick={onClick}
+      disabled={item.status !== "complete"}
+      className="w-full flex items-center justify-between px-4 py-3.5 hover:bg-gray-50
+        rounded-xl transition-colors text-left disabled:cursor-default"
+    >
+      <div className="flex items-center gap-3 min-w-0">
+        <div className="flex-shrink-0 w-9 h-9 rounded-full bg-green-100 flex items-center justify-center">
+          <span className="text-xs font-bold text-green-700">
+            {(SHOT_LABELS[item.shot_type] ?? item.shot_type).slice(0, 2).toUpperCase()}
+          </span>
+        </div>
+        <div className="min-w-0">
+          <p className="text-sm font-medium text-gray-900 truncate">
+            {SHOT_LABELS[item.shot_type] ?? item.shot_type} vs {item.pro_player_name}
+          </p>
+          <p className="text-xs text-gray-400">{date}</p>
+        </div>
+      </div>
+      {score !== null && (
+        <span className={`text-sm font-bold flex-shrink-0 ml-2 ${scoreColor}`}>
+          {Math.round(score)}%
+        </span>
+      )}
+    </button>
+  );
+}
+
+export default function HomePage() {
+  const router = useRouter();
+  const [recentJobs, setRecentJobs] = useState<JobHistoryItem[]>([]);
+  const [loadingHistory, setLoadingHistory] = useState(true);
+
+  useEffect(() => {
+    fetchJobHistory(TOKEN_PLACEHOLDER)
+      .then((data) => setRecentJobs(data.jobs.slice(0, 5)))
+      .catch(() => setRecentJobs([]))
+      .finally(() => setLoadingHistory(false));
+  }, []);
+
+  const completedJobs = recentJobs.filter((j) => j.status === "complete");
+  const avgScore =
+    completedJobs.length > 0 && completedJobs.every((j) => j.similarity_score !== null)
+      ? Math.round(completedJobs.reduce((s, j) => s + (j.similarity_score ?? 0), 0) / completedJobs.length)
+      : null;
+
+  return (
+    <main className="min-h-screen bg-white">
+      <div className="max-w-2xl mx-auto px-4 py-10 space-y-10">
+        {/* Hero */}
+        <div className="space-y-2">
+          <h1 className="text-3xl font-bold text-gray-900">TennisCoach AI</h1>
+          <p className="text-gray-500 text-sm">
+            Upload a stroke video and get instant biomechanical coaching compared to a pro.
           </p>
         </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
-        </div>
-      </main>
-    </div>
+
+        {/* Stats strip */}
+        {!loadingHistory && completedJobs.length > 0 && (
+          <div className="grid grid-cols-2 gap-4">
+            <div className="rounded-2xl border border-gray-200 px-5 py-4">
+              <p className="text-xs text-gray-400 uppercase tracking-wide">Sessions</p>
+              <p className="text-3xl font-bold text-gray-900 mt-1">{completedJobs.length}</p>
+            </div>
+            {avgScore !== null && (
+              <div className="rounded-2xl border border-gray-200 px-5 py-4">
+                <p className="text-xs text-gray-400 uppercase tracking-wide">Avg score</p>
+                <p className={`text-3xl font-bold mt-1 ${avgScore >= 70 ? "text-green-600" : avgScore >= 45 ? "text-amber-600" : "text-red-500"}`}>
+                  {avgScore}%
+                </p>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Primary CTA */}
+        <button
+          onClick={() => router.push("/analyze/new")}
+          className="w-full py-5 rounded-2xl bg-green-500 text-white font-semibold text-lg
+            hover:bg-green-600 transition-colors"
+        >
+          Analyze my stroke
+        </button>
+
+        {/* Recent analyses */}
+        {!loadingHistory && recentJobs.length > 0 && (
+          <section className="space-y-3">
+            <div className="flex items-center justify-between">
+              <h2 className="text-sm font-semibold text-gray-500 uppercase tracking-wide">Recent</h2>
+              <button
+                onClick={() => router.push("/history")}
+                className="text-xs text-green-600 hover:underline"
+              >
+                See all
+              </button>
+            </div>
+            <div className="rounded-2xl border border-gray-200 overflow-hidden divide-y divide-gray-100">
+              {recentJobs.map((item) => (
+                <RecentRow
+                  key={item.job_id}
+                  item={item}
+                  onClick={() => {
+                    if (item.report_id) router.push(`/report/${item.report_id}`);
+                  }}
+                />
+              ))}
+            </div>
+          </section>
+        )}
+
+        {!loadingHistory && recentJobs.length === 0 && (
+          <div className="text-center py-10 space-y-2">
+            <p className="text-gray-400 text-sm">No analyses yet — upload your first stroke video to get started.</p>
+          </div>
+        )}
+      </div>
+    </main>
   );
 }

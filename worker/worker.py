@@ -1,15 +1,19 @@
 """
 TennisCoach AI — Modal.com Serverless Worker
-F1: Video processing pipeline
 
 Pipeline:
-  1. Download video from S3
-  2. FFmpeg transcode → H.264 MP4
-  3. MediaPipe BlazePose — extract 33 keypoints/frame
-  4. Stroke phase detection (velocity-based heuristic)
-  5. Keypoint normalization (C++ module via pybind11)
-  6. Persist keypoints + phases to PostgreSQL
-  7. Update job status
+  1.  Download video from S3
+  2.  FFmpeg transcode → H.264 MP4
+  3.  MediaPipe BlazePose — extract 33 keypoints/frame
+  4.  Stroke phase detection (velocity-based heuristic)
+  5.  Keypoint normalization (C++ module via pybind11)
+  6.  Persist keypoints + phases to PostgreSQL
+  7.  Load pro reference keypoints from DB
+  8.  DTW alignment + similarity score (C++ via pybind11)
+  9.  Joint angle calculation + per-phase deltas (C++ via pybind11)
+  10. Gemini 2.5 Flash coaching feedback generation
+  11. Persist analysis_report + coaching_feedback rows
+  12. Update job with report_id
 """
 
 import modal
@@ -23,6 +27,7 @@ image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("ffmpeg", "libgl1")
     .pip_install_from_requirements("/requirements.txt")
+    .pip_install("google-generativeai==0.8.5")
     # C++ core module — built from source during image build
     # .run_commands("cd /core && pip install pybind11 cmake && cmake -B build && cmake --build build --config Release")
 )
@@ -256,6 +261,349 @@ def persist_results(
 
 
 # ---------------------------------------------------------------------------
+# Step 7: Load pro reference keypoints from DB
+# ---------------------------------------------------------------------------
+
+def load_pro_reference_frames(
+    sb,
+    pro_player_id: str,
+    shot_type: str,
+) -> tuple[list[list[float]], dict[int, str]]:
+    """
+    Returns normalized pro frames and a phase_map matching frame_index -> phase.
+    Fetches from pro_player_references table ordered by frame_index.
+    """
+    result = (
+        sb.table("pro_player_references")
+        .select("frame_index, keypoints, phase")
+        .eq("pro_player_id", pro_player_id)
+        .eq("shot_type", shot_type)
+        .order("frame_index")
+        .execute()
+    )
+    rows = result.data or []
+
+    frames: list[list[float]] = []
+    phase_map: dict[int, str] = {}
+    for row in rows:
+        kps = row["keypoints"]
+        flat = []
+        for pt in kps:
+            flat.extend([pt["x"], pt["y"], pt["z"]])
+        frames.append(flat)
+        phase_map[row["frame_index"]] = row["phase"]
+
+    return frames, phase_map
+
+
+# ---------------------------------------------------------------------------
+# Step 8+9: DTW alignment, similarity score, and joint angle deltas
+# ---------------------------------------------------------------------------
+
+def _calculate_joint_angles_python(frames: list[list[float]]) -> dict[str, list[float]]:
+    """Pure-Python fallback for joint angle calculation (mirrors C++ logic)."""
+    import math
+
+    def kp(frame: list[float], idx: int) -> tuple[float, float, float]:
+        return frame[idx * 3], frame[idx * 3 + 1], frame[idx * 3 + 2]
+
+    def angle(a: tuple, vertex: tuple, b: tuple) -> float:
+        v1 = (a[0] - vertex[0], a[1] - vertex[1], a[2] - vertex[2])
+        v2 = (b[0] - vertex[0], b[1] - vertex[1], b[2] - vertex[2])
+        dot = sum(v1[i] * v2[i] for i in range(3))
+        m1 = math.sqrt(sum(x * x for x in v1))
+        m2 = math.sqrt(sum(x * x for x in v2))
+        if m1 < 1e-6 or m2 < 1e-6:
+            return 0.0
+        cos_a = max(-1.0, min(1.0, dot / (m1 * m2)))
+        return math.acos(cos_a) * 180.0 / math.pi
+
+    R_SHOULDER, R_ELBOW, R_WRIST = 12, 14, 16
+    L_SHOULDER, L_ELBOW, L_WRIST = 11, 13, 15
+    R_HIP, R_KNEE, R_ANKLE = 24, 26, 28
+
+    result: dict[str, list[float]] = {
+        "right_elbow": [],
+        "left_elbow": [],
+        "right_knee": [],
+        "left_knee": [],
+        "right_shoulder_abduction": [],
+    }
+
+    for frame in frames:
+        result["right_elbow"].append(angle(kp(frame, R_SHOULDER), kp(frame, R_ELBOW), kp(frame, R_WRIST)))
+        result["left_elbow"].append(angle(kp(frame, L_SHOULDER), kp(frame, L_ELBOW), kp(frame, L_WRIST)))
+        result["right_knee"].append(angle(kp(frame, R_HIP), kp(frame, R_KNEE), kp(frame, R_ANKLE)))
+        result["left_knee"].append(angle(kp(frame, R_HIP), kp(frame, R_KNEE), kp(frame, R_ANKLE)))
+        result["right_shoulder_abduction"].append(angle(kp(frame, R_ELBOW), kp(frame, R_SHOULDER), kp(frame, R_HIP)))
+
+    return result
+
+
+def calculate_joint_angles(frames: list[list[float]]) -> dict[str, list[float]]:
+    try:
+        import tennis_core
+        return tennis_core.calculate_joint_angles(frames)
+    except ImportError:
+        return _calculate_joint_angles_python(frames)
+
+
+def _dtw_distance_python(user_frames: list[list[float]], pro_frames: list[list[float]]) -> float:
+    import math
+    n, m = len(user_frames), len(pro_frames)
+    INF = float("inf")
+    dp = [[INF] * m for _ in range(n)]
+
+    def dist(a: list[float], b: list[float]) -> float:
+        return math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b)))
+
+    dp[0][0] = dist(user_frames[0], pro_frames[0])
+    for i in range(1, n):
+        dp[i][0] = dp[i - 1][0] + dist(user_frames[i], pro_frames[0])
+    for j in range(1, m):
+        dp[0][j] = dp[0][j - 1] + dist(user_frames[0], pro_frames[j])
+    for i in range(1, n):
+        for j in range(1, m):
+            dp[i][j] = dist(user_frames[i], pro_frames[j]) + min(dp[i-1][j], dp[i][j-1], dp[i-1][j-1])
+    return dp[n - 1][m - 1] / (n + m)
+
+
+def compare_with_pro(
+    user_frames: list[list[float]],
+    user_phase_map: dict[int, str],
+    pro_frames: list[list[float]],
+    pro_phase_map: dict[int, str],
+) -> tuple[float, dict, dict]:
+    """
+    Returns:
+        similarity_score: 0–100 float
+        joint_angles: {joint: {user_mean, pro_mean, delta_mean}} per phase
+        phase_metrics: {phase: {similarity, joints}}
+    """
+    import math
+
+    # Similarity score
+    try:
+        import tennis_core
+        score = tennis_core.similarity_score(user_frames, pro_frames)
+    except ImportError:
+        dtw_dist = _dtw_distance_python(user_frames, pro_frames)
+        score = max(0.0, min(100.0, 100.0 * math.exp(-1.0 * dtw_dist)))
+
+    # Joint angles for both sequences
+    user_angles = calculate_joint_angles(user_frames)
+    pro_angles = calculate_joint_angles(pro_frames) if pro_frames else {}
+
+    phases = ["preparation", "loading", "contact", "follow_through"]
+
+    def frames_for_phase(phase_map: dict[int, str], angles: dict[str, list[float]], phase: str):
+        indices = [i for i, p in phase_map.items() if p == phase and i < len(next(iter(angles.values()), []))]
+        return indices
+
+    joint_angles_out: dict = {}
+    for joint, user_vals in user_angles.items():
+        pro_vals = pro_angles.get(joint, [])
+        user_mean = sum(user_vals) / len(user_vals) if user_vals else 0.0
+        pro_mean = sum(pro_vals) / len(pro_vals) if pro_vals else 0.0
+        joint_angles_out[joint] = {
+            "user_mean": round(user_mean, 1),
+            "pro_mean": round(pro_mean, 1),
+            "delta_mean": round(user_mean - pro_mean, 1),
+        }
+
+    phase_metrics_out: dict = {}
+    for phase in phases:
+        user_indices = frames_for_phase(user_phase_map, user_angles, phase)
+        pro_indices = frames_for_phase(pro_phase_map, pro_angles, phase)
+
+        phase_user_frames = [user_frames[i] for i in user_indices if i < len(user_frames)]
+        phase_pro_frames = [pro_frames[i] for i in pro_indices if i < len(pro_frames)]
+
+        if phase_user_frames and phase_pro_frames:
+            try:
+                import tennis_core
+                phase_sim = tennis_core.similarity_score(phase_user_frames, phase_pro_frames)
+            except ImportError:
+                d = _dtw_distance_python(phase_user_frames, phase_pro_frames)
+                phase_sim = max(0.0, min(100.0, 100.0 * math.exp(-1.0 * d)))
+        else:
+            phase_sim = score
+
+        phase_joints: dict = {}
+        for joint in user_angles:
+            u_phase = [user_angles[joint][i] for i in user_indices if i < len(user_angles[joint])]
+            p_phase = [pro_angles.get(joint, [])[i] for i in pro_indices if i < len(pro_angles.get(joint, []))]
+            if u_phase:
+                phase_joints[joint] = {
+                    "user_mean": round(sum(u_phase) / len(u_phase), 1),
+                    "pro_mean": round(sum(p_phase) / len(p_phase), 1) if p_phase else None,
+                }
+
+        phase_metrics_out[phase] = {
+            "similarity": round(phase_sim, 1),
+            "joints": phase_joints,
+        }
+
+    return round(score, 2), joint_angles_out, phase_metrics_out
+
+
+# ---------------------------------------------------------------------------
+# Step 10: Gemini 2.5 Flash coaching feedback (F4)
+# ---------------------------------------------------------------------------
+
+GEMINI_PROMPT_TEMPLATE = """You are an expert tennis coach. Analyze the biomechanical comparison below and identify up to 3 flaws that most impact performance.
+
+Shot type: {shot_type}
+Pro player compared against: {pro_player_name}
+Overall similarity score: {similarity_score}%
+
+Joint angle analysis (user vs pro, mean degrees across full stroke):
+{joint_angles_text}
+
+Phase-by-phase similarity:
+{phase_similarity_text}
+
+For each flaw you identify, respond in EXACTLY this JSON format (an array of up to 3 objects):
+[
+  {{
+    "flaw_index": 1,
+    "what": "One sentence naming the specific flaw with a concrete measurement",
+    "why": "One sentence on why this hurts performance",
+    "fix_drill": "One concrete drill or cue the player can practice immediately",
+    "impact_order": 1
+  }}
+]
+
+Rules:
+- Maximum 3 flaws, ordered by impact (1 = highest impact)
+- No jargon; plain language a club player would understand
+- Tone: direct, confident, encouraging — no hedging or filler
+- The "what" must reference specific numbers from the data above
+- Return ONLY the JSON array, no other text"""
+
+
+def _build_angles_text(joint_angles: dict) -> str:
+    lines = []
+    for joint, data in joint_angles.items():
+        delta = data["delta_mean"]
+        direction = "higher" if delta > 0 else "lower"
+        lines.append(
+            f"  {joint.replace('_', ' ')}: user={data['user_mean']}°, "
+            f"pro={data['pro_mean']}°, delta={abs(delta):.1f}° {direction}"
+        )
+    return "\n".join(lines) if lines else "  No angle data available"
+
+
+def _build_phase_text(phase_metrics: dict) -> str:
+    lines = []
+    for phase, data in phase_metrics.items():
+        lines.append(f"  {phase}: {data['similarity']:.1f}% similar to pro")
+    return "\n".join(lines) if lines else "  No phase data available"
+
+
+def generate_coaching_feedback(
+    shot_type: str,
+    pro_player_name: str,
+    similarity_score: float,
+    joint_angles: dict,
+    phase_metrics: dict,
+) -> list[dict]:
+    """Calls Gemini 2.5 Flash and returns a list of flaw dicts."""
+    import json
+    import google.generativeai as genai
+
+    genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+    model = genai.GenerativeModel("gemini-2.5-flash")
+
+    prompt = GEMINI_PROMPT_TEMPLATE.format(
+        shot_type=shot_type,
+        pro_player_name=pro_player_name,
+        similarity_score=similarity_score,
+        joint_angles_text=_build_angles_text(joint_angles),
+        phase_similarity_text=_build_phase_text(phase_metrics),
+    )
+
+    response = model.generate_content(prompt)
+    text = response.text.strip()
+
+    # Strip markdown code fences if present
+    if text.startswith("```"):
+        text = text.split("```")[1]
+        if text.startswith("json"):
+            text = text[4:]
+        text = text.strip()
+
+    flaws = json.loads(text)
+    return flaws[:3]
+
+
+def _fallback_feedback(joint_angles: dict, similarity_score: float) -> list[dict]:
+    """Returns generic feedback when Gemini is unavailable."""
+    worst_joint = max(joint_angles, key=lambda j: abs(joint_angles[j]["delta_mean"]), default=None)
+    if worst_joint and abs(joint_angles[worst_joint]["delta_mean"]) > 5:
+        delta = joint_angles[worst_joint]["delta_mean"]
+        direction = "too high" if delta > 0 else "too low"
+        return [{
+            "flaw_index": 1,
+            "what": f"Your {worst_joint.replace('_', ' ')} angle is {abs(delta):.0f}° {direction} compared to the pro.",
+            "why": "Deviations in this joint reduce stroke efficiency and consistency.",
+            "fix_drill": "Focus on matching the pro's position in slow-motion shadow swings.",
+            "impact_order": 1,
+        }]
+    return [{
+        "flaw_index": 1,
+        "what": f"Overall stroke similarity is {similarity_score:.0f}% — there is room to improve timing.",
+        "why": "Timing mismatches reduce power transfer at contact.",
+        "fix_drill": "Film yourself at 240fps and compare frame-by-frame with the pro reference.",
+        "impact_order": 1,
+    }]
+
+
+# ---------------------------------------------------------------------------
+# Step 11: Persist report + feedback
+# ---------------------------------------------------------------------------
+
+def create_report(
+    sb,
+    job_id: str,
+    user_id: str,
+    shot_type: str,
+    pro_player_id: str,
+    similarity_score: float,
+    joint_angles: dict,
+    phase_metrics: dict,
+    warning_code: str | None,
+) -> str:
+    result = sb.table("analysis_reports").insert({
+        "job_id": job_id,
+        "user_id": user_id,
+        "shot_type": shot_type,
+        "pro_player_id": pro_player_id,
+        "similarity_score": similarity_score,
+        "joint_angles": joint_angles,
+        "phase_metrics": phase_metrics,
+        "warning_code": warning_code,
+    }).execute()
+    return result.data[0]["id"]
+
+
+def store_feedback(sb, report_id: str, flaws: list[dict]) -> None:
+    rows = [
+        {
+            "report_id": report_id,
+            "flaw_index": f["flaw_index"],
+            "what": f["what"],
+            "why": f["why"],
+            "fix_drill": f["fix_drill"],
+            "impact_order": f["impact_order"],
+        }
+        for f in flaws
+    ]
+    if rows:
+        sb.table("coaching_feedback").insert(rows).execute()
+
+
+# ---------------------------------------------------------------------------
 # Main Modal function — polls for queued jobs
 # ---------------------------------------------------------------------------
 
@@ -267,17 +615,21 @@ def persist_results(
     retries=1,
 )
 def process_job(job_id: str) -> None:
+    import datetime
     import tempfile
     from supabase import create_client
 
     sb = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_ROLE_KEY"])
 
     try:
-        # Fetch job
-        result = sb.table("analysis_jobs").select("*").eq("id", job_id).single().execute()
+        # Fetch job + pro player name
+        result = sb.table("analysis_jobs").select(
+            "*, pro_players(name)"
+        ).eq("id", job_id).single().execute()
         job = result.data
         if not job:
             return
+        pro_player_name = (job.get("pro_players") or {}).get("name", "the pro")
 
         _set_stage(sb, job_id, "pose_extraction", 10)
 
@@ -307,24 +659,66 @@ def process_job(job_id: str) -> None:
         # Step 5: Normalize
         normalized = normalize_frames(frames_xyz)
 
-        # Step 6: Persist
+        # Step 6: Persist keypoints
         persist_results(sb, job_id, normalized, phase_map)
 
-        # Mark complete
-        update_kwargs = {
-            "status": "complete",
-            "stage": "complete",
-            "progress_pct": 100,
-        }
-        if warning_code:
-            update_kwargs["warning_code"] = warning_code
+        _set_stage(sb, job_id, "comparison", 80)
 
-        import datetime
-        update_kwargs["completed_at"] = datetime.datetime.utcnow().isoformat()
+        # Step 7: Load pro reference
+        pro_frames, pro_phase_map = load_pro_reference_frames(
+            sb, job["pro_player_id"], job["shot_type"]
+        )
 
-        _update_job(sb, job_id, **update_kwargs)
+        # Step 8+9: Compare — DTW similarity + joint angle deltas
+        if pro_frames:
+            similarity, joint_angles, phase_metrics = compare_with_pro(
+                normalized, phase_map, pro_frames, pro_phase_map
+            )
+        else:
+            # No reference data yet — produce a zero-delta placeholder report
+            similarity = 0.0
+            joint_angles = {}
+            phase_metrics = {}
 
-    except Exception as exc:
+        _set_stage(sb, job_id, "feedback", 90)
+
+        # Step 10: Gemini coaching feedback
+        try:
+            flaws = generate_coaching_feedback(
+                shot_type=job["shot_type"],
+                pro_player_name=pro_player_name,
+                similarity_score=similarity,
+                joint_angles=joint_angles,
+                phase_metrics=phase_metrics,
+            )
+        except Exception:
+            flaws = _fallback_feedback(joint_angles, similarity)
+
+        # Step 11: Persist report + feedback
+        report_id = create_report(
+            sb,
+            job_id=job_id,
+            user_id=job["user_id"],
+            shot_type=job["shot_type"],
+            pro_player_id=job["pro_player_id"],
+            similarity_score=similarity,
+            joint_angles=joint_angles,
+            phase_metrics=phase_metrics,
+            warning_code=warning_code,
+        )
+        store_feedback(sb, report_id, flaws)
+
+        # Step 12: Mark complete with report_id
+        _update_job(sb, job_id,
+            status="complete",
+            stage="complete",
+            progress_pct=100,
+            report_id=report_id,
+            warning_code=warning_code,
+            completed_at=datetime.datetime.utcnow().isoformat(),
+        )
+
+    except Exception:
         _update_job(sb, job_id,
             status="failed",
             error_code="WORKER_ERROR",

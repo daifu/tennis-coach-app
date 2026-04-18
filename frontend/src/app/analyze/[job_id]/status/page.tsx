@@ -13,6 +13,8 @@ const STAGES: { key: JobStage; label: string }[] = [
   { key: "pose_extraction", label: "Extracting pose" },
   { key: "phase_detection", label: "Detecting stroke phases" },
   { key: "normalization",   label: "Normalizing keypoints" },
+  { key: "comparison",      label: "Comparing to pro" },
+  { key: "feedback",        label: "Generating coaching feedback" },
   { key: "complete",        label: "Analysis complete" },
 ];
 
